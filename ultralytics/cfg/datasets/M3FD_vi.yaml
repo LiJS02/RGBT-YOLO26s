@@ -1,0 +1,13 @@
+path: /home/ljs/datasets/M3FD_YOLO/vi   # 数据集根目录（绝对路径）
+train: images/train                  # 相对 path 的训练集路径
+val: images/val                      # 相对 path 的验证集路径
+test: images/test
+
+nc: 6 
+names:                               # 类别名称列表（顺序必须与标签中的 class_id 一致）
+  0: People
+  1: Car
+  2: Bus
+  3: Lamp
+  4: Motorcycle
+  5: Truck

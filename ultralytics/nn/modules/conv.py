@@ -668,3 +668,43 @@ class Index(nn.Module):
             (torch.Tensor): Selected tensor.
         """
         return x[self.index]
+
+# 新增 ChannelSlice 层（按通道区间切片，用于把 6 通道输入分流）
+class ChannelSlice(nn.Module):
+    """Select a contiguous channel range of the input tensor.
+
+    Multi-stream models stack their input modalities along the channel axis and route them into separate branches with
+    this layer, e.g. a 6-channel visible + infrared input uses `ChannelSlice(0, 3)` for the first stream and
+    `ChannelSlice(3, 6)` for the second.
+
+    Attributes:
+        start (int): First channel of the selected range.
+        end (int): End of the selected range, exclusive.
+
+    Examples:
+        >>> m = ChannelSlice(3, 6)
+        >>> tuple(m(torch.zeros(1, 6, 8, 8)).shape)
+        (1, 3, 8, 8)
+    """
+
+    def __init__(self, start: int = 0, end: int | None = None):
+        """Initialize ChannelSlice with the channel range to select.
+
+        Args:
+            start (int): First channel of the selected range.
+            end (int, optional): End of the selected range, exclusive. Defaults to all remaining channels.
+        """
+        super().__init__()
+        self.start = start
+        self.end = end
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Select the configured channel range.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, C, H, W).
+
+        Returns:
+            (torch.Tensor): Selected channels.
+        """
+        return x[:, self.start : self.end]

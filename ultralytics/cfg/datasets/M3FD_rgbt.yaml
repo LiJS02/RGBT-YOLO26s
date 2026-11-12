@@ -1,0 +1,19 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# M3FD visible + infrared (RGB-T) detection dataset, paired by image file name.
+# Example usage: yolo detect train model=yolo26s-rgbt.yaml data=M3FD_rgbt.yaml
+
+path: /home/ljs/datasets/M3FD_YOLO/vi # visible images and labels
+ir_path: /home/ljs/datasets/M3FD_YOLO/ir # paired infrared images, same sub-tree as 'path'
+train: images/train
+val: images/val
+test: images/test
+
+nc: 6
+names:
+  0: People
+  1: Car
+  2: Bus
+  3: Lamp
+  4: Motorcycle
+  5: Truck

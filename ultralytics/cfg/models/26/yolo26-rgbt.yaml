@@ -1,0 +1,76 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# YOLO26 two-stream visible + infrared detection model with channel-concat 1x1 convolution fusion after the backbones.
+# Model docs: https://docs.ultralytics.com/models/yolo26
+# Task docs: https://docs.ultralytics.com/tasks/detect
+
+# Parameters
+nc: 6 # number of classes, override for other RGB-T datasets
+channels: 6 # stacked visible (BGR) + infrared (BGR) input channels
+end2end: True # whether to use end-to-end mode
+reg_max: 1 # DFL bins
+scales: # model compound scaling constants, i.e. 'model=yolo26s-rgbt.yaml' will call yolo26-rgbt.yaml with scale 's'
+  # [depth, width, max_channels]
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+# YOLO26 two-stream backbone: layers 1-12 carry the visible stream, the infrared stream re-reads the stacked input at
+# layer 13, and layers 25-30 fuse both streams' P3/P4/P5 outputs with channel concatenation + 1x1 convolution.
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, ChannelSlice, [0, 6]] # 0-6-channel visible + infrared input, kept for both streams
+  - [-1, 1, ChannelSlice, [0, 3]] # 1-visible (BGR)
+  - [-1, 1, Conv, [64, 3, 2]] # 2-P1/2
+  - [-1, 1, Conv, [128, 3, 2]] # 3-P2/4
+  - [-1, 2, C3k2, [256, False, 0.25]] # 4
+  - [-1, 1, Conv, [256, 3, 2]] # 5-P3/8
+  - [-1, 2, C3k2, [512, False, 0.25]] # 6
+  - [-1, 1, Conv, [512, 3, 2]] # 7-P4/16
+  - [-1, 2, C3k2, [512, True]] # 8
+  - [-1, 1, Conv, [1024, 3, 2]] # 9-P5/32
+  - [-1, 2, C3k2, [1024, True]] # 10
+  - [-1, 1, SPPF, [1024, 5, 3, True]] # 11
+  - [-1, 2, C2PSA, [1024]] # 12
+
+  - [0, 1, ChannelSlice, [3, 6]] # 13-infrared (BGR)
+  - [-1, 1, Conv, [64, 3, 2]] # 14-P1/2
+  - [-1, 1, Conv, [128, 3, 2]] # 15-P2/4
+  - [-1, 2, C3k2, [256, False, 0.25]] # 16
+  - [-1, 1, Conv, [256, 3, 2]] # 17-P3/8
+  - [-1, 2, C3k2, [512, False, 0.25]] # 18
+  - [-1, 1, Conv, [512, 3, 2]] # 19-P4/16
+  - [-1, 2, C3k2, [512, True]] # 20
+  - [-1, 1, Conv, [1024, 3, 2]] # 21-P5/32
+  - [-1, 2, C3k2, [1024, True]] # 22
+  - [-1, 1, SPPF, [1024, 5, 3, True]] # 23
+  - [-1, 2, C2PSA, [1024]] # 24
+
+  - [[6, 18], 1, Concat, [1]] # 25-fuse visible and infrared P3
+  - [-1, 1, Conv, [512, 1, 1]] # 26 (P3/8-small, 512 -> 256 to match the pretrained neck)
+  - [[8, 20], 1, Concat, [1]] # 27-fuse visible and infrared P4
+  - [-1, 1, Conv, [512, 1, 1]] # 28 (P4/16-medium)
+  - [[12, 24], 1, Concat, [1]] # 29-fuse visible and infrared P5
+  - [-1, 1, Conv, [1024, 1, 1]] # 30 (P5/32-large)
+
+# YOLO26 head
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 31
+  - [[-1, 28], 1, Concat, [1]] # 32-cat fused P4
+  - [-1, 2, C3k2, [512, True]] # 33
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 34
+  - [[-1, 26], 1, Concat, [1]] # 35-cat fused P3
+  - [-1, 2, C3k2, [256, True]] # 36 (P3/8-small)
+
+  - [-1, 1, Conv, [256, 3, 2]] # 37
+  - [[-1, 33], 1, Concat, [1]] # 38-cat head P4
+  - [-1, 2, C3k2, [512, True]] # 39 (P4/16-medium)
+
+  - [-1, 1, Conv, [512, 3, 2]] # 40
+  - [[-1, 30], 1, Concat, [1]] # 41-cat fused P5
+  - [-1, 1, C3k2, [1024, True, 0.5, True]] # 42 (P5/32-large)
+
+  - [[36, 39, 42], 1, Detect, [nc]] # 43-Detect(P3, P4, P5)

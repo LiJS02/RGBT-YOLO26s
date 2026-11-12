@@ -43,6 +43,7 @@ from ultralytics.nn.modules import (
     C3x,
     CBFuse,
     CBLinear,
+    ChannelSlice,
     Classify,
     Concat,
     Conv,
@@ -437,7 +438,7 @@ def _initialize_yolo_model(model, cfg, ch, nc, verbose):
         )
         model.yaml["backbone"][0][2] = "nn.Identity"
 
-    model.yaml["channels"] = ch  # save channels
+    ch = model.yaml["channels"] = model.yaml.get("channels", ch)  # input channels, e.g. 6 for a stacked RGB-T input
     if nc and nc != model.yaml["nc"]:
         LOGGER.info(f"Overriding model.yaml nc={model.yaml['nc']} with nc={nc}")
         model.yaml["nc"] = nc  # override YAML value
@@ -501,7 +502,7 @@ class DetectionModel(BaseModel):
 
             self.model.eval()  # Avoid changing batch statistics until training begins
             m.training = True  # Setting it to True to properly return strides
-            m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
+            m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, self.yaml["channels"], s, s))])
             self.stride = m.stride
             self.model.train()  # Set model back to training(default) mode
             m.bias_init()  # only run once
@@ -2198,6 +2199,8 @@ def parse_model(d, ch, verbose=True):
             c2 = args[0]
             c1 = ch[f]
             args = [*args[1:]]
+        elif m is ChannelSlice:  # channel range of a stacked multi-modal input, i.e. one modality of an RGB-T pair
+            c2 = args[1] - args[0]
         else:
             c2 = ch[f]
 

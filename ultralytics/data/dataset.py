@@ -18,6 +18,7 @@ from torch.utils.data import ConcatDataset
 from ultralytics.utils import LOCAL_RANK, LOGGER, NUM_THREADS, TQDM, colorstr
 from ultralytics.utils.instance import Instances
 from ultralytics.utils.ops import resample_segments, segments2boxes
+from ultralytics.utils.patches import imread
 from ultralytics.utils.torch_utils import TORCHVISION_0_18
 
 from .augment import (
@@ -539,6 +540,67 @@ class DepthDataset(YOLODataset):
             # stretch the image instead of padding
             transforms[-2] = LetterBox(new_shape=(self.imgsz, self.imgsz), scale_fill=True)
         return transforms
+
+
+class RGBTDataset(YOLODataset):
+    """Detection dataset that stacks a paired visible and infrared image into one 6-channel sample.
+
+    Visible images and labels are read from the dataset YAML's `path`; the paired infrared image is resolved by the
+    same relative path under `ir_path`, so both modalities share every augmentation. Models route the stacked
+    channels into separate streams with `ChannelSlice` layers.
+
+    Attributes:
+        ir_root (Path): Root directory holding the infrared images.
+        ir_files (list[str]): Infrared image paths paired with `im_files`, in the same order.
+
+    Examples:
+        >>> dataset = RGBTDataset(img_path="path/to/vi/images/train", data={"path": "path/to/vi", ...})
+    """
+
+    def __init__(self, *args, data: dict | None = None, task: str = "detect", **kwargs):
+        """Initialize the RGBT dataset from the dataset YAML's 'path' and 'ir_path' roots.
+
+        Args:
+            data (dict, optional): Dataset configuration dictionary.
+            task (str): Task type, one of 'detect', 'segment', 'pose', or 'obb'.
+            *args (Any): Additional positional arguments for the parent class.
+            **kwargs (Any): Additional keyword arguments for the parent class.
+        """
+        ir_root = Path((data or {}).get("ir_path", ""))
+        self.ir_root = ir_root if ir_root.is_absolute() else Path((data or {}).get("path", "")) / ir_root
+        super().__init__(*args, data=data, task=task, **kwargs)
+
+    def get_label_files(self) -> list[str]:
+        """Return the label files and pair every image with its infrared counterpart.
+
+        Returns:
+            (list[str]): List of label file paths.
+        """
+        label_files = super().get_label_files()
+        self.ir_files = [str(self.ir_root / Path(f).relative_to(self.data["path"])) for f in self.im_files]
+        missing = [f for f in self.ir_files if not Path(f).is_file()]
+        if missing:
+            raise FileNotFoundError(f"{self.prefix}Missing {len(missing)} infrared images, e.g. {missing[0]}")
+        return label_files
+
+    def get_image_and_label(self, index: int) -> dict[str, Any]:
+        """Stack this index's visible and infrared images along the channel axis.
+
+        Args:
+            index (int): Dataset index.
+
+        Returns:
+            (dict[str, Any]): Label dictionary with 'img' as a 6-channel (visible + infrared) array.
+        """
+        label = super().get_image_and_label(index)
+        im = label["img"]
+        ir = imread(self.ir_files[index], flags=cv2.IMREAD_COLOR)
+        if ir is None:
+            raise FileNotFoundError(f"{self.prefix}Infrared image not found or unreadable: {self.ir_files[index]}")
+        if ir.shape[:2] != im.shape[:2]:  # the visible image may already be resized by rect or letterbox settings
+            ir = cv2.resize(ir, (im.shape[1], im.shape[0]), interpolation=cv2.INTER_LINEAR)
+        label["img"] = np.concatenate((im, ir), axis=2)
+        return label
 
 
 class YOLOMultiModalDataset(YOLODataset):

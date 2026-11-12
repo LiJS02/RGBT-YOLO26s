@@ -21,6 +21,7 @@ from ultralytics.data.dataset import (
     DepthDataset,
     GroundingDataset,
     PolygonSemanticDataset,
+    RGBTDataset,
     SemanticDataset,
     YOLODataset,
     YOLOMultiModalDataset,
@@ -259,6 +260,8 @@ def build_yolo_dataset(
         pad = 0.0  # no pad for semantic
     elif multi_modal:
         dataset = YOLOMultiModalDataset
+    elif data.get("ir_path"):
+        dataset = RGBTDataset
     else:
         dataset = YOLODataset
 

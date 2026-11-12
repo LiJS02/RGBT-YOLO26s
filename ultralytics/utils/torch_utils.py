@@ -663,13 +663,15 @@ def get_flops(model, imgsz=640):
 
         model = unwrap_model(model)
         p = next(model.parameters())
+        yaml_cfg = getattr(model, "yaml", None)  # fused multi-channel models declare their input channels in the YAML
+        ch = yaml_cfg.get("channels", p.shape[1]) if isinstance(yaml_cfg, dict) else p.shape[1]
         if not isinstance(imgsz, list):
             imgsz = [imgsz, imgsz]  # expand if int/float
         attn = tuple(m for m in model.modules() if isinstance(m, (Attention, AAttn)))
         rtdetr = any(isinstance(m, RTDETRDecoder) for m in model.modules())
         # Attention costs are quadratic in image area, so disable THOP's affine proxy.
         stride = None if attn else max(int(model.stride.max()), 32) if hasattr(model, "stride") else 32
-        im = torch.empty((1, p.shape[1], *imgsz), device=p.device, dtype=p.dtype)  # input image in BCHW format
+        im = torch.empty((1, ch, *imgsz), device=p.device, dtype=p.dtype)  # input image in BCHW format
         custom_ops = {Attention: _attention_ops, AAttn: _attention_ops} if attn else None
         if rtdetr:  # RT-DETR cannot run the stride-sized proxy input
             return thop.profile(model, inputs=[im], custom_ops=custom_ops, verbose=False)[0] / 1e9 * 2

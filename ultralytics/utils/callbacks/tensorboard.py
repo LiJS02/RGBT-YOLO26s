@@ -58,7 +58,7 @@ def _log_tensorboard_graph(trainer) -> None:
     """
     # Input image
     imgsz = trainer.args.imgsz
-    ch = trainer.data.get("channels", 3)
+    ch = trainer.model.yaml.get("channels", 3)  # model input channels, e.g. 6 for a stacked RGB-T model
     imgsz = (imgsz, imgsz) if isinstance(imgsz, int) else imgsz
     p = next(trainer.model.parameters())  # for device, type
     im = torch.zeros((1, ch, *imgsz), device=p.device, dtype=p.dtype)  # input image (must be zeros, not empty)
