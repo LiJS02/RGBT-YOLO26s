@@ -61,6 +61,7 @@ from .block import (
     TorchVision,
 )
 from .conv import (
+    Add,
     CBAM,
     ChannelAttention,
     ChannelSlice,
@@ -110,6 +111,7 @@ from .transformer import (
 )
 
 __all__ = (
+    "Add",
     "AIFI",
     "C1",
     "C2",

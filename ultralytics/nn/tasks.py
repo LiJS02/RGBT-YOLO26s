@@ -32,6 +32,7 @@ from ultralytics.nn.modules import (
     A2C2f,
     AConv,
     ADown,
+    Add,
     Bottleneck,
     BottleneckCSP,
     C2f,
@@ -2199,6 +2200,10 @@ def parse_model(d, ch, verbose=True):
             c2 = args[0]
             c1 = ch[f]
             args = [*args[1:]]
+        elif m is Add:  # elementwise sum of equally shaped stream features
+            c2 = ch[f[0]]
+            if any(ch[index] != c2 for index in f[1:]):
+                raise ValueError(f"Add inputs must have equal channels, got {[ch[index] for index in f]}")
         elif m is ChannelSlice:  # channel range of a stacked multi-modal input, i.e. one modality of an RGB-T pair
             c2 = args[1] - args[0]
         else:

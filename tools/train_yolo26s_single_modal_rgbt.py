@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Train and test YOLO26s on M3FD visible, infrared, and RGB-T (dual-stream) images.
+"""Train and test YOLO26s on visible, infrared, and RGB-T (dual-stream) images.
 
 Features:
 - Sequential visible/infrared single-modality training.
-- Two-stream visible + infrared training with channel-concat 1x1 fusion after the backbones.
+- Two-stream visible + infrared training with independent P1-P3 stems and elementwise P3 fusion.
 - RGB-T streams seeded from the single-modality checkpoint unless --pretrained-ckpt overrides it.
 - Automatic CPU/CUDA device selection unless --device is supplied.
 - Explicit --data-vi, --data-ir, and --data-rgbt paths to prevent modality mix-ups.
@@ -20,6 +20,7 @@ import gc
 import json
 import sys
 import time
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -43,9 +44,7 @@ def repo_root() -> Path:
 
 def parse_args() -> argparse.Namespace:
     root = repo_root()
-    parser = argparse.ArgumentParser(
-        description="Train YOLO26s single-modality baselines on M3FD."
-    )
+    parser = argparse.ArgumentParser(description="Train YOLO26s visible, infrared, or RGB-T models.")
     parser.add_argument(
         "--modality",
         choices=("vi", "ir", "rgbt", "both"),
@@ -138,12 +137,6 @@ def parse_args() -> argparse.Namespace:
         help="Infrared single-modality checkpoint used to initialize the infrared RGB-T stream.",
     )
     parser.add_argument(
-        "--fusion-init",
-        choices=("mean", "visible", "ir"),
-        default="visible",
-        help="Initial fusion behavior. 'visible' preserves the visible model at step 0.",
-    )
-    parser.add_argument(
         "--head-init",
         choices=("mean", "visible", "ir"),
         default="visible",
@@ -206,12 +199,72 @@ def find_checkpoint(args: argparse.Namespace) -> Path | None:
     return None
 
 
-def stream_layer_indices(rows: list) -> tuple[int, int]:
-    """Return the first visible and first infrared layer index of a two-stream backbone definition."""
-    visible = next(i for i, row in enumerate(rows) if row[2] == "ChannelSlice" and row[3] == [0, 3])
-    infrared = next(i for i, row in enumerate(rows) if row[2] == "ChannelSlice" and row[3] == [3, 6])
-    return visible + 1, infrared + 1
+def branch_layout(rows: list) -> tuple[int, int, int, int]:
+    """Return the visible start, infrared start, early-branch length, and shared-tail start."""
+    visible_slice = next(i for i, row in enumerate(rows) if row[2] == "ChannelSlice" and row[3] == [0, 3])
+    infrared_slice = next(i for i, row in enumerate(rows) if row[2] == "ChannelSlice" and row[3] == [3, 6])
+    fusion = next(i for i, row in enumerate(rows) if row[2] == "Add")
+    visible_start = visible_slice + 1
+    infrared_start = infrared_slice + 1
+    visible_end, infrared_end = rows[fusion][0]
+    early_layers = visible_end - visible_start + 1
+    if infrared_end - infrared_start + 1 != early_layers:
+        raise RuntimeError("Visible and infrared P3 branches must have the same number of layers")
+    return visible_start, infrared_start, early_layers, fusion + 1
 
+
+def dataset_class_names(data_yaml: Path) -> dict | None:
+    """Return the {index: name} mapping of a dataset YAML, or None when it cannot be read."""
+    try:
+        from ultralytics.utils import YAML
+
+        names = YAML.load(data_yaml).get("names")
+    except Exception:
+        return None
+    if isinstance(names, list):
+        return dict(enumerate(names))
+    return names if isinstance(names, dict) else None
+
+
+def build_rgbt_model(model_name: str, names: dict | None, config_dir: Path) -> YOLO:
+    """Build a two-stream model whose detection head matches the dataset class count."""
+    model = YOLO(model_name)
+    if not names or model.model.yaml["nc"] == len(names):
+        return model
+
+    from ultralytics.utils import YAML
+
+    config = deepcopy(model.model.yaml)
+    config["nc"] = len(names)
+    config["names"] = dict(names)
+    config.pop("yaml_file", None)
+    scale = config.get("scale") or "s"
+    config_path = config_dir / f"yolo26{scale}-rgbt-nc{len(names)}.yaml"
+    YAML.save(config_path, config)
+    return YOLO(str(config_path))
+
+
+def detect_cls_row_map(source_names: dict | None, target_names: dict | None) -> list[int]:
+    """Map each target class index onto the source class index sharing its name, or -1 when there is no match."""
+    if not isinstance(source_names, dict) or not isinstance(target_names, dict):
+        return []
+    lookup = {str(name).strip().lower(): key for key, name in source_names.items()}
+    return [lookup.get(str(target_names.get(i)).strip().lower(), -1) for i in range(len(target_names))]
+
+
+def detect_cls_keys(modules, nc: int) -> set[str]:
+    """Return the state-dict keys of the detection head's classification convs."""
+    from ultralytics.nn.modules.head import Detect
+
+    return {
+        f"model.{index}.{attr}.{i}.{len(seq) - 1}.{p}"
+        for index, module in enumerate(modules)
+        if isinstance(module, Detect)
+        for attr in ("cv3", "one2one_cv3")
+        for i, seq in enumerate(getattr(module, attr, ()))
+        if getattr(seq[-1], "out_channels", None) == nc
+        for p in ("weight", "bias")
+    }
 
 
 def _source_layer_index_and_suffix(key: str) -> tuple[int, str]:
@@ -221,10 +274,30 @@ def _source_layer_index_and_suffix(key: str) -> tuple[int, str]:
     return int(parts[1]), parts[2]
 
 
-def _merge_head_tensor(current: torch.Tensor, incoming: torch.Tensor) -> torch.Tensor:
+def _merge_tensor(current: torch.Tensor, incoming: torch.Tensor) -> torch.Tensor:
     if torch.is_floating_point(current):
         return (current + incoming) / 2
     return torch.maximum(current, incoming)
+
+
+def _aligned_tensor(
+    value: torch.Tensor,
+    target_value: torch.Tensor | None,
+    target_key: str,
+    cls_keys: set[str],
+    row_map: list[int],
+    rows: list[int],
+) -> torch.Tensor | None:
+    """Return a source tensor aligned to the target, remapping classification rows by class name when needed."""
+    if target_value is None:
+        return None
+    if target_value.shape == value.shape:
+        return value
+    if rows and target_key in cls_keys and target_value.shape[1:] == value.shape[1:]:
+        tensor = target_value.clone()
+        tensor[rows] = value[torch.tensor([row_map[index] for index in rows])]
+        return tensor
+    return None
 
 
 def init_streams_from_checkpoints(
@@ -232,14 +305,13 @@ def init_streams_from_checkpoints(
     visible_checkpoint: Path,
     infrared_checkpoint: Path,
     head_init: str = "visible",
+    names: dict | None = None,
     verbose: bool = True,
 ) -> int:
-    """Seed each RGB-T stream from its own modality-specific checkpoint.
+    """Seed the two P1-P3 stems and the shared P4/P5 backbone plus head from modality-specific checkpoints.
 
-    Backbone weights come from the matching single-modality model. Compatible
-    shared-head tensors are averaged across both checkpoints. If the
-    checkpoints use the same six M3FD classes, the classification head is
-    initialized as well instead of being left random.
+    Only source backbone layers before P3 are duplicated into the visible and infrared branches. The remaining source
+    layers form the shared P4/P5 backbone and are copied once, followed by one shared detection head.
     """
     visible_source = YOLO(str(visible_checkpoint)).model.cpu().float()
     infrared_source = YOLO(str(infrared_checkpoint)).model.cpu().float()
@@ -252,114 +324,76 @@ def init_streams_from_checkpoints(
             f"{visible_backbone} versus {infrared_backbone}"
         )
 
-    visible_start, infrared_start = stream_layer_indices(model.model.yaml["backbone"])
+    visible_start, infrared_start, early_layers, shared_start = branch_layout(model.model.yaml["backbone"])
     head_offset = len(model.model.yaml["backbone"]) - visible_backbone
     target_state = model.model.state_dict()
+    cls_keys = detect_cls_keys(model.model.model, model.model.yaml["nc"])
     updates: dict[str, torch.Tensor] = {}
-    counts = {"visible": 0, "infrared": 0, "head": 0}
-    missed = {"visible": 0, "infrared": 0, "head": 0}
+    counts = {"visible": 0, "infrared": 0, "shared": 0, "head": 0}
+    missed = {"visible": 0, "infrared": 0, "shared": 0, "head": 0}
 
-    def copy_backbone(source: torch.nn.Module, target_start: int, label: str) -> None:
+    def copy_early(source: torch.nn.Module, target_start: int, label: str) -> None:
         for key, value in source.state_dict().items():
             index, suffix = _source_layer_index_and_suffix(key)
-            if index >= visible_backbone:
+            if index >= early_layers:
                 continue
             target_key = f"model.{target_start + index}.{suffix}"
-            if target_state.get(target_key) is not None and target_state[target_key].shape == value.shape:
+            target_value = target_state.get(target_key)
+            if target_value is not None and target_value.shape == value.shape:
                 updates[target_key] = value
                 counts[label] += 1
             else:
                 missed[label] += 1
 
-    copy_backbone(visible_source, visible_start, "visible")
-    copy_backbone(infrared_source, infrared_start, "infrared")
-
-    if missed["visible"] or missed["infrared"]:
-        raise RuntimeError(
-            "A backbone checkpoint does not match the two-stream model: "
-            f"{missed['visible']} visible and {missed['infrared']} infrared tensors "
-            "would keep their random init."
-        )
+    copy_early(visible_source, visible_start, "visible")
+    copy_early(infrared_source, infrared_start, "infrared")
 
     if head_init == "mean":
-        head_sources = (visible_source, infrared_source)
+        shared_sources = (visible_source, infrared_source)
     elif head_init == "ir":
-        head_sources = (infrared_source,)
+        shared_sources = (infrared_source,)
     else:
-        head_sources = (visible_source,)
+        shared_sources = (visible_source,)
 
-    for source in head_sources:
+    remapped = 0
+    for source in shared_sources:
+        row_map = detect_cls_row_map(getattr(source, "names", None), names)
+        rows = [index for index, source_index in enumerate(row_map) if source_index >= 0]
         for key, value in source.state_dict().items():
             index, suffix = _source_layer_index_and_suffix(key)
-            if index < visible_backbone:
+            if index < early_layers:
                 continue
-            target_key = f"model.{index + head_offset}.{suffix}"
-            target_tensor = target_state.get(target_key)
-            if target_tensor is None or target_tensor.shape != value.shape:
-                missed["head"] += 1
+            label = "shared" if index < visible_backbone else "head"
+            target_index = shared_start + index - early_layers if label == "shared" else index + head_offset
+            target_key = f"model.{target_index}.{suffix}"
+            target_value = target_state.get(target_key)
+            tensor = _aligned_tensor(value, target_value, target_key, cls_keys, row_map, rows)
+            if tensor is None:
+                missed[label] += 1
                 continue
             if target_key in updates:
-                updates[target_key] = _merge_head_tensor(updates[target_key], value)
+                updates[target_key] = _merge_tensor(updates[target_key], tensor)
             else:
-                updates[target_key] = value
-            counts["head"] += 1
+                updates[target_key] = tensor
+            counts[label] += 1
+            remapped += int(target_value.shape != value.shape)
 
     model.model.load_state_dict(updates, strict=False)
+    if missed["visible"] or missed["infrared"] or missed["shared"]:
+        raise RuntimeError(
+            "A checkpoint does not match the two-stream backbone: "
+            f"{missed['visible']} visible, {missed['infrared']} infrared, and {missed['shared']} shared tensors "
+            "would keep their random init."
+        )
     if verbose:
+        if remapped:
+            print(f"Remapped classification rows from pretrained weights for {remapped} head tensors")
         print(
-            f"Seeded {counts['visible']} visible backbone tensors from {visible_checkpoint} and "
-            f"{counts['infrared']} infrared backbone tensors from {infrared_checkpoint}; "
-            f"loaded/averaged {counts['head']} shared-head tensors "
+            f"Seeded {counts['visible']} visible and {counts['infrared']} infrared P1-P3 tensors, "
+            f"{counts['shared']} shared P4/P5 tensors, and {counts['head']} head tensors "
             f"({missed['head']} incompatible head tensors keep their default init)."
         )
     return len(updates)
-
-
-def fusion_layer_indices(rows: list) -> list[int]:
-    """Return the indices of the 1x1 Conv layers that fuse two concatenated streams in a backbone definition."""
-    sources = [i - 1 if row[0] == -1 else row[0] for i, row in enumerate(rows)]  # -1 is the preceding row
-    concat_rows = {i for i, row in enumerate(rows) if row[2] == "Concat" and isinstance(row[0], list)}
-    return [i for i, row in enumerate(rows) if row[2] == "Conv" and sources[i] in concat_rows and row[3][1] == 1]
-
-
-def init_fusion_layers(model: YOLO, fusion_init: str = "visible", verbose: bool = True) -> int:
-    """Initialize each 1x1 fusion Conv as the channel-aligned mean of its two input streams.
-
-    The fusion convs are the only new parameterized layers between the COCO-pretrained backbones and the
-    COCO-pretrained neck, so leaving them random scrambles the channel layout the neck and head expect and wastes their
-    pretrained weights. Setting each kernel to 0.5 * [I | I] makes a fused map the mean of the two streams, so the
-    pretrained neck keeps working from step 0 and training only has to learn the fusion residual.
-
-    Args:
-        model (YOLO): Two-stream model whose fusion convs are initialized in place.
-        verbose (bool): Print the initialized layer indices.
-
-    Returns:
-        (int): Number of initialized fusion layers.
-    """
-    rows = model.model.yaml["backbone"]  # fusion rows sit between the backbones and the neck, i.e. the last backbone rows
-    indices = fusion_layer_indices(rows)
-    for i in indices:
-        conv = model.model.model[i].conv
-        if conv.in_channels != 2 * conv.out_channels:  # a fusion concat joins two equally sized streams
-            raise ValueError(
-                f"Fusion layer {i} expects two equally sized streams, got {conv.in_channels} -> {conv.out_channels}"
-            )
-        with torch.no_grad():
-            conv.weight.zero_()
-            identity = torch.eye(conv.out_channels, device=conv.weight.device, dtype=conv.weight.dtype)
-            if fusion_init == "mean":
-                conv.weight[:, : conv.out_channels, 0, 0] = identity * 0.5
-                conv.weight[:, conv.out_channels :, 0, 0] = identity * 0.5
-            elif fusion_init == "ir":
-                conv.weight[:, conv.out_channels :, 0, 0] = identity
-            else:
-                conv.weight[:, : conv.out_channels, 0, 0] = identity
-            if conv.bias is not None:
-                conv.bias.zero_()
-    if verbose:
-        print(f"Initialized {len(indices)} fusion layers {indices} with '{fusion_init}' passthrough")
-    return len(indices)
 
 
 def resolve_model(args: argparse.Namespace) -> str:
@@ -485,7 +519,10 @@ def train_one(args: argparse.Namespace, modality: str, device: str) -> dict[str,
     else:
         if modality == "rgbt":
             resolved_model = str(args.model) if args.model else "yolo26s-rgbt.yaml"
-            model = YOLO(resolved_model)
+            names = dataset_class_names(data_yaml)
+            init_dir = project / "initialized"
+            init_dir.mkdir(parents=True, exist_ok=True)
+            model = build_rgbt_model(resolved_model, names, init_dir)
 
             visible_checkpoint = args.pretrained_vis_ckpt or args.pretrained_ckpt
             infrared_checkpoint = args.pretrained_ir_ckpt or args.pretrained_ckpt
@@ -514,14 +551,14 @@ def train_one(args: argparse.Namespace, modality: str, device: str) -> dict[str,
                 Path(visible_checkpoint).expanduser().resolve(),
                 Path(infrared_checkpoint).expanduser().resolve(),
                 head_init=args.head_init,
+                names=names,
             )
-            init_fusion_layers(model, fusion_init=args.fusion_init)
+            if names:
+                model.model.names = names
 
             # Model.train() rebuilds a model loaded from YAML and would discard
             # the in-memory initialization above. Save and reload a checkpoint
             # so Ultralytics starts training from the initialized weights.
-            init_dir = project / "initialized"
-            init_dir.mkdir(parents=True, exist_ok=True)
             init_checkpoint = init_dir / f"{name}_init.pt"
             model.save(str(init_checkpoint))
             print(f"Saved initialized RGB-T checkpoint: {init_checkpoint}")

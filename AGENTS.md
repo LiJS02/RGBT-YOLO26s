@@ -102,3 +102,28 @@ Package paths below are relative to `ultralytics/`; `docs/` and `tests/` paths a
 Subclass the task-neutral engine and override hooks; do not fork training or prediction loops. Keep format-specific export behavior in `ultralytics/utils/export/` and bind it at export time; do not add `self.format` branches to `nn/modules/head.py`. Preserve lazy imports so importing Ultralytics does not eagerly load torchvision through SAM.
 
 Dataset cache hashes use label paths and total size rather than contents or mtimes. Same-size label edits can leave stale labels in training or validation; remove the affected `.cache` after such edits (`ultralytics/data/utils.py`).
+
+
+## A100 remote experiment context
+
+- SSH alias: a100
+- Remote host: wuren@192.168.1.121:22
+- Remote repository: /home/wuren/.ljs/code/RGBT-YOLO26s
+- Remote data root: /home/wuren/.ljs/data
+- Training must use prepared YOLO datasets, not raw datasets.
+
+Preferred training data:
+- KUSTDrone: /home/wuren/.ljs/data/KUSTDrone_YOLO/yaml/
+- DVTOD: /home/wuren/.ljs/data/DVTOD_YOLO/yaml/
+- DVTOD common FOV: /home/wuren/.ljs/data/DVTOD_commonfov_YOLO/yaml/
+- RGBTDronePerson: /home/wuren/.ljs/data/RGBTDronePerson_YOLO/yaml/
+- VTUAV-det: /home/wuren/.ljs/data/VTUAV_det_YOLO/yaml/
+
+Rules:
+1. Code changes are made in the WSL workspace only.
+2. Do not copy A100 datasets into WSL.
+3. When remote dataset inspection is needed, use non-interactive `ssh a100 '...'`.
+4. Do not modify ~/.ssh, other users' files, or global server configuration.
+5. Never commit runs/, datasets/, *.pt, *.pth, *.onnx, *.engine, or *.cache.
+6. Preserve A100 absolute dataset paths in YAML files.
+7. After code changes, show the git diff and the A100 sync/training commands.

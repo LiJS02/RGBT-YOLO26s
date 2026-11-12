@@ -3,7 +3,7 @@
 
 Features:
 - Sequential visible/infrared single-modality training.
-- Two-stream visible + infrared training with channel-concat 1x1 fusion after the backbones.
+- Two-stream visible + infrared training with independent P1-P3 stems and elementwise P3 fusion.
 - RGB-T streams seeded from the single-modality checkpoint unless --pretrained-ckpt overrides it.
 - Automatic CPU/CUDA device selection unless --device is supplied.
 - Explicit --data-vi, --data-ir, and --data-rgbt paths to prevent modality mix-ups.
@@ -182,11 +182,18 @@ def find_checkpoint(args: argparse.Namespace) -> Path | None:
     return None
 
 
-def stream_layer_indices(rows: list) -> tuple[int, int]:
-    """Return the first visible and first infrared layer index of a two-stream backbone definition."""
-    visible = next(i for i, row in enumerate(rows) if row[2] == "ChannelSlice" and row[3] == [0, 3])
-    infrared = next(i for i, row in enumerate(rows) if row[2] == "ChannelSlice" and row[3] == [3, 6])
-    return visible + 1, infrared + 1
+def branch_layout(rows: list) -> tuple[int, int, int, int]:
+    """Return the visible start, infrared start, early-branch length, and shared-tail start."""
+    visible_slice = next(i for i, row in enumerate(rows) if row[2] == "ChannelSlice" and row[3] == [0, 3])
+    infrared_slice = next(i for i, row in enumerate(rows) if row[2] == "ChannelSlice" and row[3] == [3, 6])
+    fusion = next(i for i, row in enumerate(rows) if row[2] == "Add")
+    visible_start = visible_slice + 1
+    infrared_start = infrared_slice + 1
+    visible_end, infrared_end = rows[fusion][0]
+    early_layers = visible_end - visible_start + 1
+    if infrared_end - infrared_start + 1 != early_layers:
+        raise RuntimeError("Visible and infrared P3 branches must have the same number of layers")
+    return visible_start, infrared_start, early_layers, fusion + 1
 
 
 def dataset_class_names(data_yaml: Path) -> dict | None:
@@ -239,8 +246,8 @@ def detect_cls_keys(modules, nc: int) -> set[str]:
 def init_streams_from_checkpoint(model: YOLO, checkpoint: Path, names: dict | None = None, verbose: bool = True) -> int:
     """Seed both RGB-T streams and the shared head from a single-modality checkpoint.
 
-    The two-stream backbone keeps a 6-channel passthrough, one channel-slice row per stream and the fusion rows, so
-    the source layers are re-indexed onto both streams instead of being loaded by matching state-dict key names.
+    The two-stream backbone duplicates only the P1-P3 stem, keeps one shared P4/P5 tail, and adds the two P3 features,
+    so source layers are re-indexed onto the two stems and the shared tail instead of being loaded by state-dict name.
     The detection head's classification convs change shape with the class count, so instead of being skipped their rows
     are copied by class name, matching the ``cls_remap`` behaviour a single-modality fine-tune gets from
     ``BaseModel.load``. Without this the dual-stream model would start with a fully random classifier while the
@@ -256,27 +263,29 @@ def init_streams_from_checkpoint(model: YOLO, checkpoint: Path, names: dict | No
         (int): Number of transferred tensors.
 
     Raises:
-        RuntimeError: If a backbone tensor cannot be placed in both streams, which would leave one stream training from
-            a random init while the other starts from the checkpoint.
+        RuntimeError: If an early or shared backbone tensor cannot be placed, which would leave part of the model at a
+            random init while the rest starts from the checkpoint.
     """
     source = YOLO(str(checkpoint)).model
     source_backbone = len(source.yaml["backbone"])
-    visible_start, infrared_start = stream_layer_indices(model.model.yaml["backbone"])
-    head_offset = len(model.model.yaml["backbone"]) - source_backbone  # head rows shift past the second stream
+    visible_start, infrared_start, early_layers, shared_start = branch_layout(model.model.yaml["backbone"])
+    head_offset = len(model.model.yaml["backbone"]) - source_backbone  # head rows shift past the shared backbone
 
     target_state = model.model.state_dict()
     cls_keys = detect_cls_keys(model.model.model, model.model.yaml["nc"])
     row_map = detect_cls_row_map(getattr(source, "names", None), names)
     rows = [i for i, src in enumerate(row_map) if src >= 0]
     updates = {}
-    counts = {"visible": 0, "infrared": 0, "head": 0}
-    missed = {"visible": 0, "infrared": 0, "head": 0}
+    counts = {"visible": 0, "infrared": 0, "shared": 0, "head": 0}
+    missed = {"visible": 0, "infrared": 0, "shared": 0, "head": 0}
     remapped = 0
     for key, value in source.state_dict().items():
         layer, _, rest = key.partition(".")[2].partition(".")
         index = int(layer)
-        if index < source_backbone:
+        if index < early_layers:
             targets = (("visible", visible_start + index), ("infrared", infrared_start + index))
+        elif index < source_backbone:
+            targets = (("shared", shared_start + index - early_layers),)
         else:
             targets = (("head", index + head_offset),)
         for name, target in targets:
@@ -299,61 +308,20 @@ def init_streams_from_checkpoint(model: YOLO, checkpoint: Path, names: dict | No
             else:
                 missed[name] += 1
     model.model.load_state_dict(updates, strict=False)
-    if missed["visible"] or missed["infrared"]:
+    if missed["visible"] or missed["infrared"] or missed["shared"]:
         raise RuntimeError(
-            f"{checkpoint} does not match the two-stream backbone: {missed['visible']} visible and "
-            f"{missed['infrared']} infrared tensors would keep their random init."
+            f"{checkpoint} does not match the two-stream backbone: {missed['visible']} visible, "
+            f"{missed['infrared']} infrared, and {missed['shared']} shared tensors would keep their random init."
         )
     if verbose:
         if remapped and rows:
             print(f"Remapped {len(rows)}/{len(row_map)} classification rows from pretrained weights by class name")
         print(
-            f"Seeded {counts['visible']} visible + {counts['infrared']} infrared backbone tensors and "
-            f"{counts['head']} head tensors from {checkpoint} ({missed['head']} head tensors keep their default init)"
+            f"Seeded {counts['visible']} visible + {counts['infrared']} infrared P1-P3 tensors, "
+            f"{counts['shared']} shared P4/P5 tensors, and {counts['head']} head tensors from {checkpoint} "
+            f"({missed['head']} head tensors keep their default init)"
         )
     return len(updates)
-
-
-def fusion_layer_indices(rows: list) -> list[int]:
-    """Return the indices of the 1x1 Conv layers that fuse two concatenated streams in a backbone definition."""
-    sources = [i - 1 if row[0] == -1 else row[0] for i, row in enumerate(rows)]  # -1 is the preceding row
-    concat_rows = {i for i, row in enumerate(rows) if row[2] == "Concat" and isinstance(row[0], list)}
-    return [i for i, row in enumerate(rows) if row[2] == "Conv" and sources[i] in concat_rows and row[3][1] == 1]
-
-
-def init_fusion_layers(model: YOLO, verbose: bool = True) -> int:
-    """Initialize each 1x1 fusion Conv as the channel-aligned mean of its two input streams.
-
-    The fusion convs are the only new parameterized layers between the COCO-pretrained backbones and the
-    COCO-pretrained neck, so leaving them random scrambles the channel layout the neck and head expect and wastes their
-    pretrained weights. Setting each kernel to 0.5 * [I | I] makes a fused map the mean of the two streams, so the
-    pretrained neck keeps working from step 0 and training only has to learn the fusion residual.
-
-    Args:
-        model (YOLO): Two-stream model whose fusion convs are initialized in place.
-        verbose (bool): Print the initialized layer indices.
-
-    Returns:
-        (int): Number of initialized fusion layers.
-    """
-    rows = model.model.yaml["backbone"]  # fusion rows sit between the backbones and the neck
-    indices = fusion_layer_indices(rows)
-    for i in indices:
-        conv = model.model.model[i].conv
-        if conv.in_channels != 2 * conv.out_channels:  # a fusion concat joins two equally sized streams
-            raise ValueError(
-                f"Fusion layer {i} expects two equally sized streams, got {conv.in_channels} -> {conv.out_channels}"
-            )
-        with torch.no_grad():
-            conv.weight.zero_()
-            mean = torch.eye(conv.out_channels, device=conv.weight.device, dtype=conv.weight.dtype) * 0.5
-            conv.weight[:, : conv.out_channels, 0, 0] = mean
-            conv.weight[:, conv.out_channels :, 0, 0] = mean
-            if conv.bias is not None:
-                conv.bias.zero_()
-    if verbose:
-        print(f"Initialized {len(indices)} fusion layers {indices} as the mean of both streams")
-    return len(indices)
 
 
 def resolve_model(args: argparse.Namespace) -> str:
@@ -489,7 +457,6 @@ def train_one(args: argparse.Namespace, modality: str, device: str) -> dict[str,
                 )
             names = dataset_class_names(data_yaml)
             init_streams_from_checkpoint(model, Path(checkpoint).expanduser().resolve(), names=names)
-            init_fusion_layers(model)
             # Model.train() only hands the trainer this module when self.ckpt is set; otherwise the trainer rebuilds a
             # model from the YAML with random weights and every seeded tensor above is silently discarded. A non-empty
             # ckpt makes train() rebuild from the same YAML and then reload this module's weights by name and shape.

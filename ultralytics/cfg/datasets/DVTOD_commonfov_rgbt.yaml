@@ -1,0 +1,16 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# DVTOD common-FOV visible + infrared detection dataset, paired by relative image path.
+# Example usage: yolo detect train model=yolo26s-rgbt.yaml data=DVTOD_commonfov_rgbt.yaml
+
+path: /home/wuren/.ljs/data/DVTOD_commonfov_YOLO/visible # visible images and labels
+ir_path: /home/wuren/.ljs/data/DVTOD_commonfov_YOLO/ir # paired infrared images, same sub-tree as 'path'
+train: images/train
+val: images/val
+test: images/test
+
+nc: 3
+names:
+  0: person
+  1: car
+  2: bicycle

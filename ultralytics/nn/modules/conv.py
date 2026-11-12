@@ -669,7 +669,29 @@ class Index(nn.Module):
         """
         return x[self.index]
 
-# 新增 ChannelSlice 层（按通道区间切片，用于把 6 通道输入分流）
+
+class Add(nn.Module):
+    """Add multiple input tensors elementwise.
+
+    This layer combines equally shaped stream features without introducing parameters, e.g. a visible and infrared P3
+    feature map in a two-stream detector.
+    """
+
+    def forward(self, x: list[torch.Tensor]) -> torch.Tensor:
+        """Add the input tensors elementwise.
+
+        Args:
+            x (list[torch.Tensor]): Input tensors with identical shapes.
+
+        Returns:
+            (torch.Tensor): Elementwise sum of the inputs.
+        """
+        output = x[0]
+        for tensor in x[1:]:
+            output = output + tensor
+        return output
+
+
 class ChannelSlice(nn.Module):
     """Select a contiguous channel range of the input tensor.
 
